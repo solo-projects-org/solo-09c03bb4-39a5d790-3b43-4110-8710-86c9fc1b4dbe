@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -64,6 +64,75 @@ def compute_probabilities(
         prob = np.where(denom > 0, prob, np.nan)
         out[float(threshold)] = (prob.astype(np.float64), denom.copy())
     return out
+
+
+def compute_loo_sensitivity(
+    rains: Sequence[np.ndarray],
+    misses: Sequence[np.ndarray],
+    threshold: float,
+    alert_probability: float,
+    orig_prob: np.ndarray,
+    orig_denom: np.ndarray,
+    cols: int,
+) -> List[Dict[str, Any]]:
+    """Leave-one-out sensitivity over the current product's member grids.
+
+    For every (member, cell) the exceedance probability is recomputed with that
+    member removed and the warning state (``prob >= alert_probability``) is
+    compared against the current product's stored probability.
+
+    Attribution rules:
+      * a member that is missing at a cell never contributed there, so it is
+        not attributed for that cell;
+      * cells whose original probability is null (all members missing) are
+        never judged;
+      * cells whose leave-one-out set is entirely missing are never judged.
+
+    ``orig_prob`` / ``orig_denom`` are the flat probability/denominator grids
+    stored in the current product for ``threshold``. Returns one record per
+    (cell, member) flip, ordered by (row, col, member_idx).
+    """
+    stacked_rain = np.vstack([r.reshape(1, -1) for r in rains])  # (M, N)
+    stacked_miss = np.vstack([m.reshape(1, -1) for m in misses]).astype(bool)
+    valid = ~stacked_miss  # (M, N)
+    hits = valid & (stacked_rain >= float(threshold))  # (M, N)
+    total_hits = hits.sum(axis=0)  # (N,)
+
+    orig_denom = orig_denom.astype(np.int64)
+    orig_valid = orig_denom > 0  # (N,)
+    orig_warn = np.zeros(orig_denom.shape, dtype=bool)
+    # orig_prob is NaN exactly where orig_valid is False; mask before comparing
+    orig_warn[orig_valid] = orig_prob[orig_valid] >= float(alert_probability)
+
+    loo_denom = orig_denom.reshape(1, -1) - valid.astype(np.int64)  # (M, N)
+    loo_hits = total_hits.reshape(1, -1) - hits.astype(np.int64)  # (M, N)
+    loo_valid = loo_denom > 0
+    safe_denom = np.where(loo_valid, loo_denom, 1).astype(np.float64)
+    loo_prob = loo_hits.astype(np.float64) / safe_denom  # masked where invalid
+    loo_warn = np.zeros(loo_prob.shape, dtype=bool)
+    loo_warn[loo_valid] = loo_prob[loo_valid] >= float(alert_probability)
+
+    flippable = valid & orig_valid.reshape(1, -1) & loo_valid
+    flip_mask = flippable & (loo_warn != orig_warn.reshape(1, -1))
+
+    member_ids, cell_ids = np.nonzero(flip_mask)
+    records: List[Dict[str, Any]] = []
+    for mi, ci in sorted(zip(member_ids.tolist(), cell_ids.tolist()), key=lambda t: (t[1], t[0])):
+        row, col = divmod(ci, cols)
+        records.append(
+            {
+                "row": row,
+                "col": col,
+                "member_idx": mi,
+                "original_probability": float(orig_prob[ci]),
+                "loo_probability": float(loo_prob[mi, ci]),
+                "original_warning": bool(orig_warn[ci]),
+                "loo_warning": bool(loo_warn[mi, ci]),
+                "original_valid_members": int(orig_denom[ci]),
+                "loo_valid_members": int(loo_denom[mi, ci]),
+            }
+        )
+    return records
 
 
 def matrix_to_json(flat: np.ndarray, rows: int, cols: int) -> List[List[float | int | None]]:

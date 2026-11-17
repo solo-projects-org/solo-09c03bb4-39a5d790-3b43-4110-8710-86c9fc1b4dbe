@@ -23,8 +23,9 @@ from typing import Any, Dict, List, Tuple
 
 from .db import get_conn
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import RegisterRequest, SensitivityRequest, SubmitRequest
 from .storage import (
+    compute_loo_sensitivity,
     compute_probabilities,
     content_hash,
     decode_float,
@@ -37,6 +38,7 @@ from .storage import (
 
 # --- test hooks (disabled unless explicitly enabled; never on by default) ---
 PUBLISH_DELAY_S = float(os.environ.get("RAIN_TEST_PUBLISH_DELAY_S", "0"))
+SENSITIVITY_DELAY_S = float(os.environ.get("RAIN_TEST_SENSITIVITY_DELAY_S", "0"))
 FAIL_MARKER = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
 
 
@@ -352,6 +354,145 @@ def publish_product(group_id: str) -> Dict[str, Any]:
             continue
 
     raise ApiError(409, "REVISION_CHANGED", "member revisions kept changing during publish; retry the request")
+
+
+# --------------------------------------------------------------------------- #
+# Leave-one-out sensitivity
+# --------------------------------------------------------------------------- #
+def compute_sensitivity(group_id: str, payload: SensitivityRequest) -> Dict[str, Any]:
+    """Attribute warning-state flips to individual ensemble members.
+
+    Uses the member revisions recorded in the CURRENT product. The whole
+    request performs no writes: the snapshot and the revalidation are plain
+    read transactions and the NumPy recompute runs outside any transaction,
+    so even a large-grid recompute never holds the write lock and other
+    forecast times keep ingesting member grids.
+    """
+    threshold = float(payload.threshold)
+    alert = float(payload.alert_probability)
+    for attempt in range(1, 4):
+        # 1) consistent snapshot of the current product, its revision set and grids
+        with get_conn() as conn:
+            try:
+                conn.execute("BEGIN")
+                group = _get_group(conn, group_id)
+                if threshold not in [float(t) for t in group["thresholds"]]:
+                    raise ApiError(
+                        422,
+                        "THRESHOLD_NOT_REGISTERED",
+                        f"threshold {threshold} is not registered for this group "
+                        f"(registered: {group['thresholds']})",
+                    )
+                prow = conn.execute(
+                    "SELECT product_id, revision_map FROM products"
+                    " WHERE group_id = ? AND is_current = 1",
+                    (group_id,),
+                ).fetchone()
+                if prow is None:
+                    raise ApiError(
+                        404,
+                        "NO_CURRENT_PRODUCT",
+                        "no current product for this group; sensitivity is computed "
+                        "from the current product's member revisions, publish first",
+                    )
+                product_id = int(prow["product_id"])
+                revision_map = {int(k): int(v) for k, v in json.loads(prow["revision_map"]).items()}
+                n = group["rows"] * group["cols"]
+                orig_prob = None
+                orig_denom = None
+                for trow in conn.execute(
+                    "SELECT threshold, probability_blob, denom_blob"
+                    " FROM product_thresholds WHERE product_id = ?",
+                    (product_id,),
+                ):
+                    if float(trow["threshold"]) == threshold:
+                        orig_prob = decode_float(trow["probability_blob"], n)
+                        orig_denom = decode_int(trow["denom_blob"], n)
+                        break
+                if orig_prob is None or orig_denom is None:
+                    raise ApiError(
+                        500,
+                        "COMPUTE_FAILED",
+                        "current product is missing rows for a registered threshold",
+                    )
+                member_rows = conn.execute(
+                    "SELECT member_idx, member_id FROM members WHERE group_id = ? ORDER BY member_idx",
+                    (group_id,),
+                ).fetchall()
+                rains: List[Any] = []
+                misses: List[Any] = []
+                id_by_idx: Dict[int, str] = {}
+                for m in member_rows:
+                    idx = int(m["member_idx"])
+                    id_by_idx[idx] = m["member_id"]
+                    r = conn.execute(
+                        "SELECT rain_blob, miss_blob FROM member_revisions"
+                        " WHERE group_id = ? AND member_idx = ? AND revision = ?",
+                        (group_id, idx, revision_map[idx]),
+                    ).fetchone()
+                    if r is None:
+                        raise ApiError(
+                            500,
+                            "COMPUTE_FAILED",
+                            "member revision referenced by the current product is missing",
+                        )
+                    rains.append(decode_float(r["rain_blob"], n))
+                    misses.append(decode_mask(r["miss_blob"], n))
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        # 2) leave-one-out recompute OUTSIDE any transaction: no lock held,
+        #    other forecast times keep ingesting meanwhile
+        if SENSITIVITY_DELAY_S > 0:
+            time.sleep(SENSITIVITY_DELAY_S)
+        try:
+            flips = compute_loo_sensitivity(
+                rains, misses, threshold, alert, orig_prob, orig_denom, group["cols"]
+            )
+        except Exception as exc:  # a failed recompute must not deliver anything
+            raise ApiError(500, "COMPUTE_FAILED", f"sensitivity computation failed: {exc}") from exc
+
+        # 3) the source product must still be current at delivery time; if a
+        #    correction superseded it (or a new product replaced it) while we
+        #    were recomputing, these conclusions are stale -> never deliver them
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT product_id FROM products WHERE group_id = ? AND is_current = 1",
+                (group_id,),
+            ).fetchone()
+        if row is None or int(row["product_id"]) != product_id:
+            if attempt >= 3:
+                raise ApiError(
+                    409,
+                    "REVISION_CHANGED",
+                    "current product changed during sensitivity computation; retry the request",
+                )
+            continue
+
+        for rec in flips:
+            rec["member_id"] = id_by_idx[rec["member_idx"]]
+        return {
+            "group_id": group_id,
+            "product_id": product_id,
+            "threshold": threshold,
+            "alert_probability": alert,
+            "members_used": [
+                {"member_idx": idx, "member_id": id_by_idx[idx], "revision": revision_map[idx]}
+                for idx in sorted(revision_map)
+            ],
+            "flip_count": len(flips),
+            "flipped_cell_count": len({(rec["row"], rec["col"]) for rec in flips}),
+            "flips": flips,
+        }
+
+    raise ApiError(
+        409,
+        "REVISION_CHANGED",
+        "current product kept changing during sensitivity computation; retry the request",
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -21,6 +21,9 @@
 | 两实例交错上传/发布只能产生同组修订的完整产品 | 发布在写事务内重新核对“每个成员的最新修订”，若计算期间发生更正则整体重试；产品只以一致修订集落库（见下节） |
 | 计算失败不得留半份当前结果 | 产品主行与全部阈值行在同一 `BEGIN IMMEDIATE` 事务插入，任何异常整体回滚（自测含故障注入验证） |
 | 慢计算不阻塞其他时次入仓 | NumPy 计算在写事务**之外**完成，计算期间不持写锁；仅在最后落库阶段短时加锁 |
+| 单时次留一敏感性归因 | `POST /groups/{gid}/sensitivity`：按现行产品的成员修订逐成员留一重算，返回预警状态翻转的（格点, 成员）、原/留一概率与有效成员数 |
+| 缺测成员不归因、空概率不判翻转 | 该格缺测的成员不参与该格归因；原概率为空（全缺测）或留一后全缺测的格点不判翻转 |
+| 计算期间更正/替换产品不交付旧结论 | 敏感性全程只用只读事务、重算在事务外；交付前复核现行产品身份，已变更则按新基线重试（≤3 次），否则 `409 REVISION_CHANGED` |
 | 可启动的双实例 Docker Compose 和 Swagger | `docker compose up` 起 `api-a`(:8081)/`api-b`(:8082)，共享命名卷；Swagger 在 `/docs` |
 
 ### 交错发布的一致性（核心并发设计）
@@ -35,6 +38,16 @@
 SQLite 启用 WAL + `busy_timeout=10s`；所有写事务为 `BEGIN IMMEDIATE`，进程间靠单写者锁串行化，
 锁竞争失败返回 `409/503` 提示重试，不会产生脏写或半份产品。
 
+### 留一敏感性的一致性（与发布同理）
+
+1. 只读事务取快照：现行产品 ID、其 `revision_map`、对应成员网格与该产品存储的原概率/分母；
+2. 释放事务，在外面做逐成员留一重算（**全程不取写锁**，大网格重算期间其他时次照常入仓）；
+3. 交付前再次读取现行产品：仍是同一产品才返回结论；
+   若计算期间成员更正使产品过期、或新产品替换了来源产品 → 结论作废，按新基线整体重试（最多 3 次），
+   仍不稳定则 `409 REVISION_CHANGED`；期间若无现行产品则 `404 NO_CURRENT_PRODUCT`，绝不交付旧结论。
+
+预警判定：`probability >= alert_probability` 视为预警格点；翻转 = 移除某成员后该格预警状态改变。
+
 ## 2. API 一览（Swagger 见 `/docs`，OpenAPI 见 `/openapi.json`）
 
 | 方法 | 路径 | 说明 |
@@ -46,6 +59,7 @@ SQLite 启用 WAL + `busy_timeout=10s`；所有写事务为 `BEGIN IMMEDIATE`，
 | PUT | `/groups/{gid}/members/{mid}` | 提交/更正成员网格修订 |
 | POST | `/groups/{gid}/publish` | 发布概率产品（成员齐全） |
 | GET | `/groups/{gid}/products/current` | 当前可用于预警的产品（无则 404） |
+| POST | `/groups/{gid}/sensitivity` | 留一敏感性：哪些成员翻转了预警格点 |
 | GET | `/groups/{gid}/products` | 全部产品（含过期历史） |
 | GET | `/groups/{gid}/products/{pid}` | 按 ID 查历史产品 |
 
@@ -94,9 +108,41 @@ curl -s localhost:8082/groups/$GID/products/current
 }
 ```
 
+### 留一敏感性示例
+
+```bash
+# 已登记阈值 5.0、概率警戒线 0.5：哪些成员左右了预警格点？
+curl -s -X POST localhost:8081/groups/$GID/sensitivity -H 'Content-Type: application/json' \
+  -d '{"threshold": 5.0, "alert_probability": 0.5}'
+```
+
+响应片段（每条翻转记录含格点、成员、原/留一概率、预警方向与有效成员数）：
+
+```json
+{
+  "product_id": 1,
+  "threshold": 5.0,
+  "alert_probability": 0.5,
+  "flip_count": 1,
+  "flipped_cell_count": 1,
+  "flips": [
+    {
+      "row": 1, "col": 0,
+      "member_idx": 0, "member_id": "m1",
+      "original_probability": 0.5,
+      "loo_probability": 0.0,
+      "original_warning": true, "loo_warning": false,
+      "original_valid_members": 2, "loo_valid_members": 1
+    }
+  ]
+}
+```
+
 错误统一为 `{"error": {"code": "...", "message": "..."}}`：
 `VALIDATION_ERROR(422)`、`GRID_MISMATCH(422)`、`NEGATIVE_RAIN(422)`、
+`THRESHOLD_NOT_REGISTERED(422)`、
 `REVISION_CONFLICT(409)`、`REVISION_CONTENT_CONFLICT(409)`、`MEMBERS_INCOMPLETE(409)`、
+`REVISION_CHANGED(409)`、
 `NO_CURRENT_PRODUCT(404)`、`GROUP_NOT_FOUND/MEMBER_NOT_FOUND/PRODUCT_NOT_FOUND(404)`、
 `COMPUTE_FAILED(500)`、`DATABASE_BUSY(503)`。
 
@@ -120,12 +166,13 @@ pip install -r requirements.txt
 ```
 
 环境变量：`RAIN_DB_PATH`（默认 `/data/rainfall.db`）、`RAIN_BUSY_TIMEOUT_MS`（默认 10000）。
-另有两个**默认关闭**的测试钩子：`RAIN_TEST_PUBLISH_DELAY_S`（发布计算延时）、
-`RAIN_TEST_FAIL_MARKER`（该文件存在时发布计算确定性失败），仅用于自测，生产不要设置。
+另有三个**默认关闭**的测试钩子：`RAIN_TEST_PUBLISH_DELAY_S`（发布计算延时）、
+`RAIN_TEST_SENSITIVITY_DELAY_S`（留一重算延时）、`RAIN_TEST_FAIL_MARKER`（该文件存在时发布计算确定性失败），
+仅用于自测，生产不要设置。
 
 ## 4. 自测
 
-`tests/selftest.py` 只用标准库，默认自动拉起两个共享同一 SQLite 的 uvicorn 实例并跑 64 项断言：
+`tests/selftest.py` 只用标准库，默认自动拉起两个共享同一 SQLite 的 uvicorn 实例并跑 100+ 项断言：
 
 ```bash
 python tests/selftest.py
@@ -135,7 +182,8 @@ RAIN_BASE_A=http://127.0.0.1:8081 RAIN_BASE_B=http://127.0.0.1:8082 python tests
 
 覆盖：参数校验、幂等/异文拒收、修订号顺序、成员齐全门禁、概率与分母数学、全缺测空值、
 更正即过期与历史可查、双实例交错发布一致性、并行发布幂等、故障注入下无半份产品、
-慢计算不阻塞其他时次入仓、Swagger/OpenAPI 可用性。
+慢计算不阻塞其他时次入仓、留一敏感性数学与缺测归因规则、敏感性与更正交错时不交付旧结论、
+Swagger/OpenAPI 可用性。
 
 ## 5. 目录结构
 
@@ -143,8 +191,8 @@ RAIN_BASE_A=http://127.0.0.1:8081 RAIN_BASE_B=http://127.0.0.1:8082 python tests
 app/
   main.py       FastAPI 路由、统一错误处理、启动建表
   schemas.py    Pydantic 请求模型与结构校验
-  service.py    登记/提交/发布/查询事务逻辑与并发控制
-  storage.py    网格序列化、内容哈希、NumPy 概率计算
+  service.py    登记/提交/发布/留一敏感性/查询事务逻辑与并发控制
+  storage.py    网格序列化、内容哈希、NumPy 概率与留一重算
   db.py         SQLite 连接、WAL、schema
   errors.py     统一 API 异常
 tests/selftest.py   端到端自测（双实例）

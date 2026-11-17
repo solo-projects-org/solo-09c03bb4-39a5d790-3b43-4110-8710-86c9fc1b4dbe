@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .db import init_db
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import RegisterRequest, SensitivityRequest, SubmitRequest
 from . import service
 
 app = FastAPI(
@@ -98,6 +98,15 @@ def publish(group_id: str) -> dict:
 )
 def current_product(group_id: str) -> dict:
     return service.get_current_product(group_id)
+
+
+@app.post(
+    "/groups/{group_id}/sensitivity",
+    tags=["sensitivity"],
+    summary="留一敏感性分析：定位左右预警格点判断的成员",
+)
+def sensitivity(group_id: str, payload: SensitivityRequest) -> dict:
+    return service.compute_sensitivity(group_id, payload)
 
 
 @app.get(

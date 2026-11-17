@@ -110,3 +110,30 @@ class SubmitRequest(BaseModel):
         # errors share the same JSON error envelope.
         _check_grid(self.rain, self.missing)
         return self
+
+
+class SensitivityRequest(BaseModel):
+    threshold: float = Field(
+        ..., description="rainfall threshold; must be one of the group's registered thresholds"
+    )
+    alert_probability: float = Field(
+        ..., description="warning line in [0, 1]: probability >= line means the cell is in warning state"
+    )
+
+    @field_validator("threshold")
+    @classmethod
+    def _threshold(cls, v: float) -> float:
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv) or fv < 0:
+            raise ValueError("threshold must be finite and non-negative")
+        return fv
+
+    @field_validator("alert_probability")
+    @classmethod
+    def _alert(cls, v: float) -> float:
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv):
+            raise ValueError("alert_probability must be finite")
+        if not 0.0 <= fv <= 1.0:
+            raise ValueError("alert_probability must be within [0, 1]")
+        return fv

@@ -93,6 +93,7 @@ def spawn_servers() -> Tuple[list, str, str, str, str]:
     env.update(
         RAIN_DB_PATH=db_path,
         RAIN_TEST_PUBLISH_DELAY_S="0.6",
+        RAIN_TEST_SENSITIVITY_DELAY_S="0.6",
         RAIN_TEST_FAIL_MARKER=fail_marker,
         PYTHONPATH=ROOT,
     )
@@ -434,11 +435,164 @@ def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None
     check("openapi.json served", s == 200 and "paths" in openapi)
     for path in ("/groups", "/groups/{group_id}/members/{member_id}",
                  "/groups/{group_id}/publish",
-                 "/groups/{group_id}/products/current"):
+                 "/groups/{group_id}/products/current",
+                 "/groups/{group_id}/sensitivity"):
         check(f"path {path} documented", path in openapi["paths"])
     req = urllib.request.Request(base_a + "/docs")
     with urllib.request.urlopen(req, timeout=10) as resp:
         check("Swagger UI served", resp.status == 200 and b"swagger" in resp.read().lower())
+
+    print("\n[13] leave-one-out sensitivity: math, attribution and validation")
+    gs = register(base_a, members=3, rows=2, cols=3, thresholds=[5.0, 10.0])
+    gids = gs["group_id"]
+    s, _ = http("PUT", base_a, f"/groups/{gids}/members/m1",
+                {"rain": [[10, 10, 10], [0, 10, 0]],
+                 "missing": [[0, 0, 0], [1, 0, 0]], "revision": 1})
+    check("s m1 rev1", s == 200)
+    s, _ = http("PUT", base_b, f"/groups/{gids}/members/m2",
+                {"rain": [[0, 10, 0], [0, 0, 0]],
+                 "missing": [[0, 0, 0], [1, 1, 0]], "revision": 1})
+    check("s m2 rev1", s == 200)
+    s, _ = http("PUT", base_a, f"/groups/{gids}/members/m3",
+                {"rain": [[0, 0, 0], [0, 0, 7]],
+                 "missing": [[0, 0, 1], [1, 1, 0]], "revision": 1})
+    check("s m3 rev1", s == 200)
+
+    s, d = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                {"threshold": 5.0, "alert_probability": 0.5})
+    check("sensitivity before publish -> 404 NO_CURRENT_PRODUCT",
+          s == 404 and d["error"]["code"] == "NO_CURRENT_PRODUCT", str(d))
+
+    s, ps = http("POST", base_a, f"/groups/{gids}/publish")
+    check("publish for sensitivity group", s == 200, str(ps))
+
+    s, d = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                {"threshold": 7.0, "alert_probability": 0.5})
+    check("unregistered threshold rejected",
+          s == 422 and d["error"]["code"] == "THRESHOLD_NOT_REGISTERED", str(d))
+    s, d = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                {"threshold": 5.0, "alert_probability": 1.5})
+    check("alert line > 1 rejected", s == 422 and d["error"]["code"] == "VALIDATION_ERROR")
+    s, d = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                {"threshold": 5.0, "alert_probability": -0.1})
+    check("negative alert line rejected", s == 422)
+    s, d = http("POST", base_a, "/groups/nope/sensitivity",
+                {"threshold": 5.0, "alert_probability": 0.5})
+    check("unknown group -> 404", s == 404 and d["error"]["code"] == "GROUP_NOT_FOUND")
+
+    s, sens = http("POST", base_b, f"/groups/{gids}/sensitivity",
+                   {"threshold": 5.0, "alert_probability": 0.5})
+    check("sensitivity computed via instance B", s == 200, str(sens))
+    check("sensitivity bound to current product", sens["product_id"] == ps["product_id"])
+    check("members_used reflects product revisions",
+          {m["member_id"]: m["revision"] for m in sens["members_used"]}
+          == {"m1": 1, "m2": 1, "m3": 1})
+    flips = sens["flips"]
+    got = {(f["row"], f["col"], f["member_id"]) for f in flips}
+    expected = {(0, 0, "m2"), (0, 0, "m3"), (0, 2, "m1"), (1, 2, "m1"), (1, 2, "m2")}
+    check("exactly the expected (cell, member) flips", got == expected, str(got))
+    check("flip counts", sens["flip_count"] == 5 and sens["flipped_cell_count"] == 3,
+          f'{sens["flip_count"]}/{sens["flipped_cell_count"]}')
+    f = next(x for x in flips if (x["row"], x["col"], x["member_id"]) == (0, 0, "m2"))
+    check("flip record probabilities",
+          approx(f["original_probability"], 1 / 3) and approx(f["loo_probability"], 0.5), str(f))
+    check("flip record warning direction",
+          f["original_warning"] is False and f["loo_warning"] is True)
+    check("flip record valid member counts",
+          f["original_valid_members"] == 3 and f["loo_valid_members"] == 2)
+    f = next(x for x in flips if (x["row"], x["col"], x["member_id"]) == (0, 2, "m1"))
+    check("removing the only hitting member flips warning off",
+          approx(f["original_probability"], 0.5) and approx(f["loo_probability"], 0.0)
+          and f["original_warning"] is True and f["loo_warning"] is False
+          and f["loo_valid_members"] == 1, str(f))
+    check("member missing at a cell is never attributed there",
+          all(f["member_id"] != "m3" or (f["row"], f["col"]) != (0, 2) for f in flips))
+    check("null-probability and leave-one-out-all-missing cells never judged",
+          all((f["row"], f["col"]) not in {(1, 0), (1, 1)} for f in flips))
+
+    s, sens10 = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                     {"threshold": 10.0, "alert_probability": 0.5})
+    got10 = {(f["row"], f["col"], f["member_id"]) for f in sens10["flips"]}
+    check("second registered threshold analyzed independently",
+          s == 200 and got10 == {(0, 0, "m2"), (0, 0, "m3"), (0, 2, "m1")}
+          and sens10["flip_count"] == 3, str(got10))
+
+    s, listing = http("GET", base_a, f"/groups/{gids}/products")
+    check("sensitivity is read-only (no products created)", len(listing["products"]) == 1)
+
+    print("\n[14] correction invalidates the sensitivity basis; republish restores it")
+    s, _ = http("PUT", base_b, f"/groups/{gids}/members/m2",
+                {"rain": [[10, 10, 10], [10, 10, 10]],
+                 "missing": [[0, 0, 0], [1, 1, 0]], "revision": 2})
+    check("correction rev2 accepted", s == 200)
+    s, d = http("POST", base_a, f"/groups/{gids}/sensitivity",
+                {"threshold": 5.0, "alert_probability": 0.5})
+    check("no stale conclusions while no current product",
+          s == 404 and d["error"]["code"] == "NO_CURRENT_PRODUCT", str(d))
+    s, ps2 = http("POST", base_a, f"/groups/{gids}/publish")
+    check("republish after correction", s == 200 and ps2["product_id"] != ps["product_id"])
+    s, sens2 = http("POST", base_b, f"/groups/{gids}/sensitivity",
+                    {"threshold": 5.0, "alert_probability": 0.5})
+    check("sensitivity uses the new product", s == 200 and sens2["product_id"] == ps2["product_id"])
+    check("members_used shows corrected revision",
+          {m["member_id"]: m["revision"] for m in sens2["members_used"]}
+          == {"m1": 1, "m2": 2, "m3": 1})
+    check("conclusions recomputed from new grids (no flips remain)",
+          sens2["flip_count"] == 0, str(sens2["flips"]))
+
+    print("\n[15] sensitivity vs concurrent correction: stale conclusions never delivered")
+    gi = register(base_a, members=3, rows=16, cols=16, thresholds=[5.0])
+    gidi = gi["group_id"]
+    for i, inst in enumerate((base_a, base_b, base_a)):
+        grid = [[float((i + 1) * (r * 3 + c) % 17) for c in range(16)] for r in range(16)]
+        s, _ = http("PUT", inst, f"/groups/{gidi}/members/m{i + 1}",
+                    {"rain": grid, "revision": 1})
+        assert s == 200
+    s, pi = http("POST", base_a, f"/groups/{gidi}/publish")
+    assert s == 200
+
+    sens_result: Dict[str, Any] = {}
+
+    def worker_sensitivity() -> None:
+        sens_result["result"] = http("POST", base_a, f"/groups/{gidi}/sensitivity",
+                                     {"threshold": 5.0, "alert_probability": 0.5})
+
+    t = threading.Thread(target=worker_sensitivity)
+    t.start()
+    time.sleep(0.15)  # let the sensitivity request enter its slow recompute phase
+    t0 = time.time()
+    s, corr = http("PUT", base_b, f"/groups/{gidi}/members/m2",
+                   {"rain": [[3.0] * 16 for _ in range(16)], "revision": 2})
+    corr_elapsed = time.time() - t0
+    check("correction accepted during sensitivity recompute", s == 200, str(corr))
+    if hooks_enabled:
+        check("correction write not blocked by the recompute", corr_elapsed < 0.5,
+              f"{corr_elapsed:.2f}s")
+    t0 = time.time()
+    g_other = register(base_b, members=2, rows=3, cols=3, thresholds=[5.0])
+    http("PUT", base_b, f"/groups/{g_other['group_id']}/members/m1",
+         {"rain": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], "revision": 1})
+    s, _ = http("PUT", base_b, f"/groups/{g_other['group_id']}/members/m2",
+                {"rain": [[9.0, 8.0, 7.0], [6.0, 5.0, 4.0], [3.0, 2.0, 1.0]], "revision": 1})
+    ingest_elapsed = time.time() - t0
+    check("other forecast time kept ingesting during the recompute", s == 200)
+    if hooks_enabled:
+        check("other time ingest stayed fast", ingest_elapsed < 0.5, f"{ingest_elapsed:.2f}s")
+    t.join()
+    st, body = sens_result["result"]
+    if hooks_enabled:
+        check("stale conclusions not delivered (404 after mid-compute correction)",
+              st == 404 and body["error"]["code"] == "NO_CURRENT_PRODUCT", str(sens_result))
+    else:
+        check("sensitivity answered consistently", st in (200, 404, 409), str(sens_result))
+    s, pi2 = http("POST", base_a, f"/groups/{gidi}/publish")
+    check("republish after interleaved correction", s == 200)
+    s, sens3 = http("POST", base_b, f"/groups/{gidi}/sensitivity",
+                    {"threshold": 5.0, "alert_probability": 0.5})
+    check("post-republish sensitivity bound to the new product",
+          s == 200 and sens3["product_id"] == pi2["product_id"], str(sens3))
+    check("post-republish sensitivity uses the corrected revision",
+          any(m["member_id"] == "m2" and m["revision"] == 2 for m in sens3["members_used"]))
 
 
 if __name__ == "__main__":
